@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instantdownloader"
+version = "0.1.0"
+description = "CLI and desktop foundation for controlled Instagram video downloads."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openpyxl>=3.1.0",
+    "yt-dlp>=2024.12.0",
+]
+
+[project.optional-dependencies]
+gui = [
+    "customtkinter>=5.2,<6",
+    "Pillow>=10,<13",
+]
+profiles = ["instaloader>=4.14,<5"]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+instantdownloader = "instantdownloader.cli.main:main"
+
+[project.gui-scripts]
+instantdownloader-gui = "instantdownloader.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
