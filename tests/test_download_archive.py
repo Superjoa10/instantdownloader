@@ -74,6 +74,48 @@ def test_archive_is_written_only_after_conversion(fake_media, monkeypatch):
     assert result.finished_at >= conversion_finished[0]
 
 
+def test_successful_conversion_keeps_only_compatible_download(fake_media, monkeypatch):
+    config, raw, processed = fake_media
+    config.compatible_mp4 = True
+    sources = []
+
+    def convert(path, config, cancel_event):
+        sources.append(path)
+        target = path.with_name(path.stem + ' [compatible].mp4')
+        target.write_bytes(b'validated conversion')
+        return target
+
+    monkeypatch.setattr(downloader, 'make_compatible_mp4', convert)
+    unrelated = config.output_dir / 'unrelated.mp4'
+    unrelated.write_bytes(b'keep')
+    result = downloader.download_job(DownloadJob('https://example.com/video'), config)
+    assert result.status == 'success'
+    assert result.output_path.read_bytes() == b'validated conversion'
+    assert not sources[0].exists()
+    assert unrelated.read_bytes() == b'keep'
+    assert config.download_archive.read_text() == 'test 123\n'
+
+
+def test_cancel_after_conversion_preserves_source(fake_media, monkeypatch):
+    config, raw, processed = fake_media
+    config.compatible_mp4 = True
+    cancel = Event()
+    sources = []
+
+    def convert(path, config, cancel_event):
+        sources.append(path)
+        target = path.with_name(path.stem + ' [compatible].mp4')
+        target.write_bytes(b'converted')
+        cancel.set()
+        return target
+
+    monkeypatch.setattr(downloader, 'make_compatible_mp4', convert)
+    result = downloader.download_job(DownloadJob('https://example.com/video'), config, cancel_event=cancel)
+    assert result.status == 'cancelled'
+    assert sources[0].exists()
+    assert not config.download_archive.exists()
+
+
 @pytest.mark.parametrize("failure", [RuntimeError("conversion failed"), downloader.DownloadCancelled("cancelled")])
 def test_failed_conversion_does_not_poison_archive(fake_media, monkeypatch, failure):
     config, raw, processed = fake_media
@@ -88,6 +130,7 @@ def test_failed_conversion_does_not_poison_archive(fake_media, monkeypatch, fail
     assert result.status == ("cancelled" if isinstance(failure, downloader.DownloadCancelled) else "error")
     assert result.output_path is None
     assert config.download_archive.read_text() == "test unrelated\n"
+    assert list(config.output_dir.glob('*.mp4'))
 
 
 def test_missing_output_never_records_archive(fake_media, monkeypatch):

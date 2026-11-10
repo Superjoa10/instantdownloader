@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "instantdownloader"
-version = "0.1.0"
+version = "1.0.0"
 description = "CLI and desktop foundation for controlled Instagram video downloads."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,7 +18,7 @@ gui = [
     "customtkinter>=5.2,<6",
     "Pillow>=10,<13",
 ]
-profiles = ["instaloader>=4.14,<5"]
+profiles = ["instaloader>=4.16,<5", "playwright>=1.50,<2"]
 dev = [
     "pytest>=8.0.0",
 ]

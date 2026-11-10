@@ -12,6 +12,7 @@ download_archive.txt
 
 # Local state, authentication and generated artifacts.
 .instantdownloader-state/
+instagram-auth/
 .env
 .env.*
 !.env.example

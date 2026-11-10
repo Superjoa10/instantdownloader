@@ -247,12 +247,17 @@ def download_job(
                 Path(explicit_path) if explicit_path else prepared, captured_path
             )
             _check_cancelled(cancel_event)
+            conversion_source = None
             if config.compatible_mp4:
                 progress_hook({"status": "converting"})
+                conversion_source = output_path.resolve()
                 output_path = make_compatible_mp4(output_path, config, cancel_event)
             _require_output(output_path)
             probed_width, probed_height = probe_resolution(output_path, config)
             _check_cancelled(cancel_event)
+            # Conversion commits only after codec and full-decode validation.
+            if conversion_source is not None and conversion_source != output_path.resolve():
+                conversion_source.unlink()
             # yt-dlp's own archive formatter retains extractor and legacy-ID semantics.
             if config.download_archive:
                 original_record(deferred_records[-1] if deferred_records else raw)
@@ -389,10 +394,12 @@ def make_compatible_mp4(
     _check_cancelled(cancel_event)
     _require_output(path)
     if path.suffix.lower() == ".mp4" and _compatible_streams(path, config):
+        validate_media(path, config, cancel_event)
         _check_cancelled(cancel_event)
         return path.resolve()
 
-    compatible_path = path.with_name(f"{path.stem}.h264.mp4")
+    stem = path.stem.removesuffix('.h264')
+    compatible_path = path.with_name(f"{stem} [compatible].mp4")
     fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".mp4", dir=path.parent)
     os.close(fd)
     temporary_path = Path(temporary)
@@ -401,12 +408,19 @@ def make_compatible_mp4(
         _media_binary(config, "ffmpeg"),
         "-y",
         "-nostdin",
+        "-v", "error",
+        "-xerror",
         "-i",
         str(path),
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2:out_range=tv,format=yuv420p",
         "-c:v",
         "libx264",
         "-pix_fmt",
         "yuv420p",
+        "-color_range", "tv",
+        "-tag:v", "avc1",
         "-c:a",
         "aac",
         "-b:a",
@@ -417,32 +431,48 @@ def make_compatible_mp4(
     ]
 
     try:
-        _check_cancelled(cancel_event)
-        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
-            try:
-                while True:
-                    _check_cancelled(cancel_event)
-                    try:
-                        _, stderr = process.communicate(timeout=0.1)
-                        break
-                    except subprocess.TimeoutExpired:
-                        continue
-            except BaseException:
-                process.terminate()
-                try:
-                    process.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.communicate()
-                raise
-            if process.returncode:
-                raise RuntimeError(f"ffmpeg conversion failed: {stderr.strip()[-2000:]}")
+        _run_media_command(command, cancel_event)
         _check_cancelled(cancel_event)
         _require_output(temporary_path)
+        if not _compatible_streams(temporary_path, config):
+            raise RuntimeError("Converted output is not H.264/yuv420p with AAC audio.")
+        validate_media(temporary_path, config, cancel_event)
+        _check_cancelled(cancel_event)
         os.replace(temporary_path, compatible_path)
         return compatible_path.resolve()
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _run_media_command(command: list[str], cancel_event: Event | None = None) -> None:
+    _check_cancelled(cancel_event)
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
+        try:
+            while True:
+                _check_cancelled(cancel_event)
+                try:
+                    _, stderr = process.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            process.terminate()
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            raise
+        if process.returncode:
+            raise RuntimeError(f"ffmpeg conversion/validation failed: {stderr.strip()[-2000:]}")
+
+
+def validate_media(path: Path, config: DownloadConfig, cancel_event: Event | None = None) -> None:
+    """Decode every audio/video packet before accepting a compatible output."""
+    _run_media_command([
+        _media_binary(config, "ffmpeg"), "-nostdin", "-v", "error", "-xerror",
+        "-i", str(path), "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-",
+    ], cancel_event)
 
 
 def probe_resolution(path: Path, config: DownloadConfig) -> tuple[int | None, int | None]:

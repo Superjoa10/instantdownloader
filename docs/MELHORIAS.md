@@ -1,5 +1,18 @@
 # Melhorias Planejadas
 
+## Prioridade: Listar Todos os Reels
+
+Objetivo: listar os Reels publicamente acessiveis de uma conta sem pedir login
+do Instagram ao cliente ou abrir navegador. Pesquisa, teste HTTP real,
+alternativas e criterios de aceite em [PESQUISA_REELS.md](PESQUISA_REELS.md).
+
+Status em 2026-11-06: a rota REST alternativa testada respondeu HTTP 401;
+nao ha coleta integral anonima validada. Por decisao do usuario, priorizar
+solucoes locais, admitindo login: plano A com sessao local nas bibliotecas
+Python; plano B com navegador dedicado via Playwright. Apify fica como plano C,
+sem ativacao ou integracao nesta etapa. Uso pessoal, sem backend comercial.
+Nao anunciar cobertura integral antes de validar paginacao real.
+
 ## Skills para Codex e Claude
 
 Status: proposta registrada; as skills ainda nao foram criadas nem instaladas.
@@ -52,7 +65,7 @@ instantdownloader queue run --report-dir reports
 
 No PowerShell, definir a variavel equivalente com `$env:INSTANTDOWNLOADER_HOME`. A skill deve usar a sintaxe do shell real e argumentos separados, sem concatenar URLs/caminhos em comandos sujeitos a injecao.
 
-`--limit` conta posts examinados e aceita de 1 a 1000. `complete: true` indica que a consulta limitada terminou; NAO prova que o perfil inteiro foi coletado. Posts e Reels sao consultados separadamente. Repetir a consulta hoje recomeca pelo feed, sem cursor persistido de pagina.
+`--limit` conta publicacoes examinadas por origem e aceita de 1 a 1000. `complete: true` indica que a consulta limitada terminou; NAO prova que o perfil inteiro foi coletado. Desde 2026-11-03, `--scope all` combina Feed e Reels, deduplica e retorna `counts`, `inspected`, `exhausted` e `all_collected`. Este ultimo exige chegar ao fim das origens solicitadas, sem erro; nao garante acesso a conteudo privado/excluido. Repetir a consulta hoje recomeca pelo feed, sem cursor persistido de pagina.
 
 ### Melhorias na CLI antes da skill completa
 
@@ -60,7 +73,7 @@ No PowerShell, definir a variavel equivalente com `$env:INSTANTDOWNLOADER_HOME`.
 2. **Execucoes identificadas:** `run_id` e filtros por execucao para listar, executar, cancelar, exportar e retomar tarefas. A automacao nao pode consumir a fila de outro pedido.
 3. **Excel na fila persistente:** adicionar uma operacao de importacao de Excel na CLI. Hoje a interface importa para a fila, mas `batch` executa diretamente. Reutilizar o mesmo validador de planilhas.
 4. **Saida para agentes:** JSON consistente para downloads, batches, descoberta e fila; progresso separado dos resultados; resumo com contagens, falhas, caminhos absolutos e relatorio. O agente nao deve depender de interpretar mensagens livres do terminal.
-5. **Estado honesto de descoberta:** distinguir consulta limitada concluida, feed esgotado, cancelamento, login necessario, bloqueio e coleta parcial. Informar posts examinados, videos encontrados e escopo consultado.
+5. **Estado honesto de descoberta:** contagens e esgotamento por origem ja implementados. Falta padronizar codigos estruturados para cancelamento, login necessario e bloqueio, sem depender das mensagens do provedor.
 6. **Verificacao do ambiente:** comando de diagnostico para Python, versao do aplicativo, extras instalados, FFmpeg/FFprobe, permissoes de escrita e espaco disponivel. A skill nao instala ou atualiza dependencias sem a autorizacao aplicavel.
 
 Os nomes e flags dos novos comandos serao definidos na implementacao. Nao apresentar esses recursos planejados como disponiveis na versao atual.
@@ -110,6 +123,21 @@ Enquanto a coleta integral nao existir, a skill deve explicar a limitacao ou exe
 - Pedidos representativos sao validados nos dois agentes, no macOS e no Windows, antes de considerar a skill pronta.
 
 ## Outros Proximos Passos
+
+### CLI e skill: implementacao de 2026-11-09
+
+Disponiveis agora: sessao dedicada explicita na CLI, filtros inclusivos de
+publicacao em UTC compartilhados com o Tkinter, consulta de datas ausentes,
+manifestos versionados/checkpoints, filter-list para lista pronta, download-list,
+JSON para URL/Excel/fila/sessao e recusa de enfileiramento parcial por padrao.
+Contrato e exemplos em [CLI_AUTOMACAO.md](CLI_AUTOMACAO.md). A skill portatil esta
+em `skills/instantdownloader/SKILL.md`, sem instalacao global em agentes.
+
+Ainda pendentes dos planos acima: coleta integral retomavel por cursor,
+diagnostico de ambiente dedicado, correcao/validacao do caminho Feed, empacotamento
+Windows e validacao da instalacao/descoberta da skill nos dois clientes.
+queue run continua global para os pendentes do diretorio de dados; usar
+download-list direto para nao iniciar tarefas de outros pedidos.
 
 - Concluir validacao real no Windows e empacotamento com FFmpeg/FFprobe.
 - Evoluir a descoberta limitada para coleta integral retomavel antes de prometer o fluxo automatico de conta inteira.

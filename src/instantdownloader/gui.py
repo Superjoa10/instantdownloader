@@ -18,6 +18,8 @@ from .core.downloader import analyze_url
 from .core.excel import read_jobs_from_excel
 from .core.models import DownloadJob
 from .core.profiles import discover_profile, normalize_profile
+from .core.publication_dates import publication_day, cutoff_day, load_publication_dates, filter_publications
+from .core.instagram_session import InstagramSession, SessionError, LOG as SESSION_LOG, configure_session_logging
 from .core.queue import QueueRunner, export_tasks
 from .core.store import AppLock, Store, canonical_url, data_dir
 from .core.thumbnail import load_thumbnail
@@ -52,20 +54,25 @@ class InstantDownloaderApp(ctk.CTk):
         self.runner = QueueRunner(self.store, self.emit)
         self.worker = None
         self.worker_cancel = threading.Event()
+        self.session_confirm = threading.Event()
+        self.instagram_session = InstagramSession(self.home)
+        self.last_session_error = ''
         self.closing = False
         self.info = None
         self.analyzed_url = None
         self.profile_items = []
+        self.profile_result = None
+        self.profile_scopes = ('posts', 'reels')
         self.thumbnail_image = None
         self.last_progress_at = 0.0
         defaults = {'output': str(Path.home()/'Downloads/InstantDownloader'), 'quality': 'Melhor disponivel',
-                    'browser': 'chrome', 'theme': 'Light', 'session_file': '', 'login': '',
+                    'browser': 'chrome', 'theme': 'Light', 'session_file': '', 'login': '', 'profile_browser': 'Nao usar',
                     'report_dir': str(self.home/'reports')}
         self.settings = {k: ctk.StringVar(value=self.prefs.get(k, v)) for k, v in defaults.items()}
         self.settings['cookies'] = ctk.BooleanVar(value=self.prefs.get('cookies', False))
         self.settings['compatible'] = ctk.BooleanVar(value=self.prefs.get('compatible', True))
         self.url, self.excel, self.profile_url = ctk.StringVar(), ctk.StringVar(), ctk.StringVar()
-        self.limit, self.scope = ctk.StringVar(value='10'), ctk.StringVar(value='Posts')
+        self.limit, self.scope = ctk.StringVar(value='10'), ctk.StringVar(value='Feed + Reels')
         self.status = ctk.StringVar(value='Pronto para adicionar videos.')
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -230,23 +237,50 @@ class InstantDownloaderApp(ctk.CTk):
         page.grid_columnconfigure(0, weight=1)
         page.grid_rowconfigure(3, weight=1)
         self.label(page, 'Perfil do Instagram', 20, True).grid(row=0, column=0, sticky='w')
-        self.label(page, 'EXPERIMENTAL  /  A listagem pode exigir uma sessao autenticada.', 11, muted=True).grid(row=1, column=0, sticky='w', pady=(4, 12))
         row = ctk.CTkFrame(page, fg_color='transparent')
-        row.grid(row=2, column=0, sticky='ew', pady=(0, 12))
+        row.grid(row=2, column=0, sticky='ew', pady=(8, 8))
         row.grid_columnconfigure(0, weight=1)
         ctk.CTkEntry(row, textvariable=self.profile_url, height=36).grid(row=0, column=0, sticky='ew')
-        self.menu(row, self.scope, ['Posts', 'Reels'], 90).grid(row=0, column=1, padx=8)
+        self.menu(row, self.scope, ['Feed', 'Reels', 'Feed + Reels'], 135).grid(row=0, column=1, padx=8)
         self.menu(row, self.limit, ['10', '25', '50', '100', '250', '500', '1000'], 65).grid(row=0, column=2)
         self.button(row, 'Descobrir', self.discover, width=100).grid(row=0, column=3, padx=(8, 0))
-        self.profile_tree = self.tree(page, ('title', 'date'), ('Video', 'Data'), (420, 115))
+        self.profile_tree = self.tree(page, ('title', 'source', 'date'), ('Video', 'Origem', 'Data'), (330, 105, 105))
+        self.profile_tree.heading('title', anchor='w')
+        self.profile_tree.heading('date', text='Data (UTC)')
+        self.profile_tree.column('source', anchor='center')
+        self.profile_tree.column('date', anchor='center', width=125, minwidth=125)
+        self.profile_tree.empty_label.place_configure(y=20)
         self.profile_tree.master.grid(row=3, column=0, sticky='nsew')
         row = ctk.CTkFrame(page, fg_color='transparent')
         row.grid(row=4, column=0, sticky='ew', pady=(10, 0))
-        self.button(row, 'Selecionar todos', lambda: self.profile_tree.selection_set(self.profile_tree.get_children()), True, width=125).pack(side='left')
-        self.button(row, 'Adicionar selecionados', self.add_profile, width=170).pack(side='left', padx=8)
-        self.button(row, 'Parar consulta', self.worker_cancel.set, True, width=110).pack(side='right')
-        self.profile_feedback = self.label(page, 'Limite por consulta: quantidade de posts examinados.', 12, muted=True, wraplength=680, justify='left')
+        self.profile_select_button = self.button(row, 'Selecionar todos', lambda: self.profile_tree.selection_set(self.profile_tree.get_children()), True, width=125)
+        self.profile_select_button.pack(side='left')
+        self.profile_add_button = self.button(row, 'Adicionar selecionados', self.add_profile, width=170)
+        self.profile_add_button.pack(side='left', padx=8)
+        self.profile_stop_button = self.button(row, 'Parar consulta', self.worker_cancel.set, True, width=110)
+        self.profile_stop_button.pack(side='right')
+        for button in (self.profile_select_button, self.profile_add_button, self.profile_stop_button):
+            button.configure(state='disabled')
+        self.profile_feedback = self.label(page, 'Limite por origem: publicacoes examinadas, incluindo fotos.', 12, muted=True, wraplength=680, justify='left')
         self.profile_feedback.grid(row=5, column=0, sticky='ew', pady=(8, 0))
+        self.profile_counts = self.label(page, 'Feed: 0 | Reels: 0 | Unicos: 0 | Selecionados: 0', 12, muted=True)
+        self.profile_counts.grid(row=6, column=0, sticky='w', pady=(4, 0))
+        self.profile_tree.bind('<<TreeviewSelect>>', lambda _: self.update_profile_counts())
+        self.profile_actions = ctk.CTkFrame(page, fg_color='transparent')
+        self.profile_actions.grid(row=7, column=0, sticky='w', pady=(8, 0))
+        self.profile_session_button = self.button(self.profile_actions, 'Configurar sessao', lambda: self.show('Configuracoes'), width=145)
+        self.profile_session_button.pack(side='left')
+        self.button(self.profile_actions, 'Detalhes', self.profile_error_details, True, width=80).pack(side='left', padx=8)
+        self.profile_actions.grid_remove()
+        self.profile_cutoff = ctk.StringVar()
+        filters = ctk.CTkFrame(page, fg_color='transparent')
+        filters.grid(row=8, column=0, sticky='ew', pady=(8, 0))
+        filters.grid_columnconfigure(1, weight=1)
+        self.label(filters, 'Ate (DD/MM/AAAA)', 12).grid(row=0, column=0, padx=(0, 8))
+        ctk.CTkEntry(filters, textvariable=self.profile_cutoff, placeholder_text='DD/MM/AAAA',
+                     width=130, height=32).grid(row=0, column=1, sticky='ew')
+        self.button(filters, 'Selecionar ate', self.select_profile_until, width=115).grid(row=0, column=2, padx=8)
+        self.button(filters, 'Carregar datas', self.load_profile_dates, True, width=115).grid(row=0, column=3)
 
     def tree(self, parent, columns, headings, widths):
         frame = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=6)
@@ -301,6 +335,38 @@ class InstantDownloaderApp(ctk.CTk):
     def _settings_page(self):
         page = ctk.CTkScrollableFrame(self.pages['Configuracoes'], fg_color='transparent')
         page.pack(fill='both', expand=True)
+        self.label(page, 'Conexao com Instagram', 18, True).pack(anchor='w')
+        self.session_status = ctk.StringVar(value=(
+            'Cookies capturados; verificacao pendente. Teste a conexao ou reconecte.' if self.instagram_session.pending_path.exists() else
+            'Sessao salva; teste a conexao.' if self.instagram_session.saved else 'Instagram desconectado.'))
+        self.session_label = ctk.CTkLabel(page, textvariable=self.session_status, anchor='w', justify='left', text_color=TEXT, wraplength=620)
+        self.session_label.pack(fill='x', pady=(8, 8))
+        page.bind('<Configure>', lambda e: self.session_label.configure(wraplength=max(180, e.width-28)), add='+')
+        row = ctk.CTkFrame(page, fg_color='transparent')
+        row.pack(fill='x')
+        row.grid_columnconfigure((0, 1, 2), weight=1)
+        self.session_buttons = []
+        for col, (title, action) in enumerate([
+                ('Reconectar Instagram' if self.instagram_session.captured else 'Conectar Instagram', lambda: self.session_action('connect')),
+                ('Testar conexao', lambda: self.session_action('test')),
+                ('Apagar sessao', lambda: self.session_action('delete'))]):
+            button = self.button(row, title, action, col != 0, width=100)
+            button.grid(row=0, column=col, sticky='ew', padx=(0, 6))
+            self.session_buttons.append(button)
+        self.session_confirm_button = self.button(page, 'Conclui o login - verificar', self.confirm_instagram_login)
+        self.session_confirm_button.pack(anchor='w', pady=(8, 8))
+        self.session_confirm_button.configure(state='disabled')
+        self.label(page, 'Perfil para testar Reels', muted=True).pack(anchor='w', pady=(12, 4))
+        ctk.CTkEntry(page, textvariable=self.profile_url, placeholder_text='@perfil ou URL', height=36).pack(fill='x')
+        test = self.button(page, 'Testar ate 20 Reels', lambda: self.session_action('reels'), True)
+        test.pack(anchor='w', pady=8)
+        self.session_buttons.append(test)
+        self.session_cancel_button = self.button(page, 'Cancelar operacao', self.worker_cancel.set, True)
+        self.session_cancel_button.pack(anchor='w', pady=(0, 16))
+        self.session_cancel_button.configure(state='disabled')
+        self.session_error_button = self.button(page, 'Ver ultimo erro', self.show_session_error, True)
+        self.session_error_button.pack(anchor='w', pady=(0, 12))
+        self.session_error_button.configure(state='disabled')
         self.label(page, 'Aparencia', 18, True).pack(anchor='w')
         self.appearance_choice = ctk.StringVar(value=next(k for k, v in APPEARANCE.items() if v == self.settings['theme'].get()))
         self.segments(page, list(APPEARANCE), variable=self.appearance_choice, command=self.change_theme).pack(anchor='w', pady=(8, 20))
@@ -310,13 +376,107 @@ class InstantDownloaderApp(ctk.CTk):
         self.menu(page, self.settings['browser'], ['chrome', 'firefox', 'edge', 'safari']).pack(anchor='w', pady=(0, 16))
         self.label(page, 'Pasta de relatorios', bold=True).pack(anchor='w')
         self.path_field(page, 'report_dir', lambda: self.choose_directory('report_dir'))
-        self.label(page, 'Sessao para descobrir perfis', 18, True).pack(anchor='w', pady=(20, 4))
+        self.button(page, 'Conexao avancada (opcional)', self.toggle_advanced_session, True).pack(anchor='w', pady=(20, 4))
+        self.advanced_session = ctk.CTkFrame(page, fg_color='transparent')
+        outer = page
+        page = self.advanced_session
         self.label(page, 'Opcional. Arquivo de sessao do Instaloader e usuario associado.', muted=True, wraplength=620).pack(anchor='w')
         self.label(page, 'Usuario da sessao', size=12, muted=True).pack(anchor='w', pady=(12, 0))
         ctk.CTkEntry(page, textvariable=self.settings['login'], placeholder_text='Usuario da sessao', height=36).pack(fill='x', pady=8)
         self.path_field(page, 'session_file', self.choose_session)
+        self.label(page, 'Ou usar sessao do navegador para consultar perfis', size=12, muted=True).pack(anchor='w', pady=(12, 4))
+        self.menu(page, self.settings['profile_browser'], ['Nao usar', 'chrome', 'firefox', 'edge', 'safari'], 180).pack(anchor='w')
+        self.label(page, 'Informe acima seu usuario do Instagram. O navegador selecionado substitui o arquivo de sessao nesta consulta. A leitura de cookies pede confirmacao.', muted=True, wraplength=620, justify='left').pack(anchor='w', pady=8)
+        page = outer
         self.label(page, 'Cookies e sessoes nao sao incluidos nos relatorios.\nFila sequencial; pausa automatica ao detectar limite de acesso.', muted=True, wraplength=620, justify='left').pack(anchor='w', pady=18)
         self.button(page, 'Salvar preferencias', self.save_settings, width=175).pack(anchor='w', pady=(0, 16))
+
+    def toggle_advanced_session(self):
+        if self.advanced_session.winfo_manager():
+            self.advanced_session.pack_forget()
+        else:
+            self.advanced_session.pack(fill='x', pady=8)
+
+    def session_action(self, action):
+        if (self.worker and self.worker.is_alive()) or self.runner.running:
+            self.status.set('Aguarde a tarefa atual antes de alterar ou testar a sessao.')
+            return
+        if action == 'connect' and not messagebox.askyesno('Conectar Instagram',
+                'Vamos abrir um navegador exclusivo do aplicativo. Entre diretamente no Instagram.\n\n'
+                'Permitir salvar os cookies de sessao neste computador para consultar perfis? '
+                'Eles dao acesso a sua conta. Nao lemos seu Chrome pessoal nem salvamos sua senha. '
+                'Voce pode apagar a sessao nas configuracoes.', parent=self):
+            return
+        if action == 'delete' and not messagebox.askyesno('Apagar sessao local',
+                'Remover os cookies salvos pelo InstantDownloader? Seu navegador pessoal nao sera alterado. '
+                'Isso nao revoga outras sessoes no Instagram.', parent=self):
+            return
+        profile = None
+        if action == 'reels':
+            try:
+                profile = normalize_profile(self.profile_url.get())
+            except ValueError:
+                self.session_status.set('Informe um perfil valido para testar a listagem de Reels.')
+                return
+
+        self.session_confirm.clear()
+
+        def task():
+            started = time.monotonic()
+            SESSION_LOG.info('ui_operation=%s result=started', action)
+            try:
+                if action == 'delete':
+                    self.instagram_session.delete()
+                    message = 'Sessao local apagada. Instagram desconectado.'
+                elif action == 'connect':
+                    username = self.instagram_session.connect(self.worker_cancel, self.session_confirm,
+                        on_progress=lambda message: self.emit('session_progress', message),
+                        on_ready=lambda: self.emit('session_login_ready', None),
+                        on_attempt_error=lambda message: self.emit('session_attempt_error', message))
+                    message = f'Conectado como @{username}. Sessao salva localmente. Listagem de Reels ainda nao testada.'
+                elif action == 'test':
+                    username = self.instagram_session.test(self.worker_cancel)
+                    message = f'Login confirmado: @{username}. Listagem e downloads nao foram testados.'
+                else:
+                    local = self.instagram_session.load()
+                    result = discover_profile(profile, limit=20, scope='reels',
+                        cancel_event=self.worker_cancel, local_session=local)
+                    state = ('Fim da origem informado pelo Instagram.' if result.all_collected else
+                             'Limite do teste atingido; podem existir mais Reels.' if result.complete else
+                             f'Consulta incompleta ({result.error_code}). Total desconhecido.\n{result.message}')
+                    message = (f'Perfil: @{profile}\nReels encontrados: {len(result.items)} | '
+                               f'Publicacoes examinadas: {result.inspected.get("reels", 0)} | '
+                               f'Paginas: {result.pages.get("reels", 0)}\n{state}')
+                    SESSION_LOG.info('ui_operation=reels complete=%s items=%d inspected=%d pages=%d error_code=%s elapsed_seconds=%.1f',
+                                     result.complete, len(result.items), result.inspected.get('reels', 0),
+                                     result.pages.get('reels', 0), result.error_code, time.monotonic()-started)
+                    if not result.complete:
+                        self.emit('session_error', f'{message}\nTempo: {time.monotonic()-started:.1f} s')
+                        return
+                self.emit('session_result', f'{message}\nTempo: {time.monotonic()-started:.1f} s')
+            except SessionError as exc:
+                SESSION_LOG.warning('ui_operation=%s result=failed error_type=SessionError elapsed_seconds=%.1f', action, time.monotonic()-started)
+                self.emit('session_result' if self.worker_cancel.is_set() else 'session_error', str(exc))
+            except Exception as exc:
+                SESSION_LOG.error('ui_operation=%s result=failed error_type=%s elapsed_seconds=%.1f', action, type(exc).__name__, time.monotonic()-started)
+                self.emit('session_error', 'Operacao nao concluida. Confira os logs do terminal.')
+
+        if self.work(task):
+            for button in self.session_buttons:
+                button.configure(state='disabled')
+            self.session_cancel_button.configure(state='normal')
+            self.session_status.set('Entre no Instagram e conclua as telas seguintes. Depois clique em Conclui o login - verificar.' if action == 'connect' else 'Verificando...')
+
+    def confirm_instagram_login(self):
+        if self.session_confirm_button.cget('state') == 'disabled' or self.worker_cancel.is_set():
+            return
+        self.session_confirm_button.configure(state='disabled')
+        self.session_status.set('Aguardando a pagina estabilizar e verificando a identidade...')
+        self.session_confirm.set()
+
+    def show_session_error(self):
+        if self.last_session_error:
+            messagebox.showerror('Falha na conexao com Instagram', self.last_session_error, parent=self)
 
     def path_field(self, parent, key, command):
         row = ctk.CTkFrame(parent, fg_color='transparent')
@@ -450,29 +610,128 @@ class InstantDownloaderApp(ctk.CTk):
     def discover(self):
         try:
             profile, limit = normalize_profile(self.profile_url.get()), int(self.limit.get())
-            scope = self.scope.get().lower()
+            scope = {'Feed': 'posts', 'Posts': 'posts', 'Reels': 'reels', 'Feed + Reels': 'all'}[self.scope.get()]
             session, login = self.settings['session_file'].get().strip(), self.settings['login'].get().strip()
+            browser = self.settings['profile_browser'].get()
+            browser = None if browser == 'Nao usar' else browser
+            local = self.instagram_session.load() if self.instagram_session.captured else None
+            if local:
+                session, login, browser = '', '', None
+            if browser and not login:
+                raise ValueError('Informe seu usuario do Instagram em Configuracoes antes de usar a sessao do navegador.')
         except Exception as exc:
             self.status.set(str(exc))
+            return
+        if browser and not messagebox.askyesno('Usar sessao do Instagram',
+                f'Permitir a leitura de cookies do {browser} para esta consulta?\n'
+                'Somente os cookies do Instagram serao usados. Eles ficam em memoria, sem salvar em arquivos ou relatorios.', parent=self):
             return
         def task():
             def on_item(item):
                 self.store.save_discovery(profile, asdict(item))
                 self.emit('discovery_item', asdict(item))
             result = discover_profile(profile, limit=limit, scope=scope, cancel_event=self.worker_cancel,
-                on_item=on_item, session_file=Path(session) if session else None, login=login or None)
-            self.emit('discovery_done', result.message)
+                on_item=on_item, session_file=Path(session) if session and not browser else None,
+                login=login or None, browser=browser, local_session=local)
+            SESSION_LOG.info('ui_operation=profile scope=%s complete=%s error_code=%s failed_source=%s items=%d inspected_posts=%d inspected_reels=%d pages_reels=%d',
+                             scope, result.complete, result.error_code, result.failed_source, len(result.items),
+                             result.inspected.get('posts', 0), result.inspected.get('reels', 0), result.pages.get('reels', 0))
+            self.emit('discovery_done', result)
         if self.work(task):
-            self.profile_items = self.store.discoveries(profile)
+            self.profile_items = []
+            self.profile_result = None
+            self.profile_scopes = ('posts', 'reels') if scope == 'all' else (scope,)
+            self.profile_actions.grid_remove()
+            self.profile_stop_button.configure(state='normal')
             self.render_profile()
-            self.profile_feedback.configure(text=f'Consultando @{profile}. Limite: {limit} posts. Resultados anteriores preservados.')
+            self.profile_tree.empty_label.configure(text='Consultando perfil...')
+            self.profile_feedback.configure(text=f'Consultando @{profile}. Limite: {limit} publicacoes por origem.')
             self.status.set('Descobrindo videos...')
 
     def render_profile(self):
+        selected = self.profile_tree.selection()
         self.profile_tree.delete(*self.profile_tree.get_children())
         for i, item in enumerate(self.profile_items):
-            self.profile_tree.insert('', 'end', iid=str(i), values=(item['title'], str(item['date'])[:10]))
-        self.profile_tree.empty_label.place_forget() if self.profile_items else self.profile_tree.empty_label.place(relx=.5, rely=.5, anchor='center')
+            sources = item.get('sources', [])
+            origin = 'Feed + Reels' if len(sources) == 2 else 'Reels' if 'reels' in sources else 'Feed' if 'posts' in sources else '-'
+            day = publication_day(item.get('date'))
+            self.profile_tree.insert('', 'end', iid=str(i), values=(item['title'], origin, day.strftime('%d/%m/%Y') if day else 'Nao informada'))
+        self.profile_tree.selection_set([i for i in selected if self.profile_tree.exists(i)])
+        self.profile_tree.empty_label.place_forget() if self.profile_items else self.profile_tree.empty_label.place(relx=.5, rely=.5, y=20, anchor='center')
+        self.update_profile_counts()
+
+    def update_profile_counts(self):
+        def count(source):
+            if source not in self.profile_scopes:
+                return '-'
+            value = sum(source in item.get('sources', []) for item in self.profile_items)
+            result = self.profile_result
+            if result and not result.exhausted.get(source, False):
+                if not result.complete and not value:
+                    return '?'
+                return f'{value}+'
+            return str(value)
+        feed, reels = count('posts'), count('reels')
+        self.profile_counts.configure(text=f'Feed: {feed} | Reels: {reels} | Unicos: {len(self.profile_items)} | Selecionados: {len(self.profile_tree.selection())}')
+        self.profile_select_button.configure(state='normal' if self.profile_items else 'disabled')
+        self.profile_add_button.configure(state='normal' if self.profile_tree.selection() else 'disabled')
+
+    def profile_error_details(self):
+        if self.profile_result:
+            messagebox.showinfo('Detalhes da consulta', self.profile_result.message, parent=self)
+
+    def select_profile_until(self):
+        try:
+            cutoff = cutoff_day(self.profile_cutoff.get())
+        except ValueError as exc:
+            self.status.set(str(exc))
+            return
+        if (self.worker and self.worker.is_alive()) or self.runner.running:
+            self.status.set('Aguarde a tarefa atual antes de selecionar por data.')
+            return
+        if any(not publication_day(item.get('date')) for item in self.profile_items):
+            self.load_profile_dates(cutoff)
+        else:
+            self.apply_profile_cutoff(cutoff)
+
+    def apply_profile_cutoff(self, cutoff):
+        selected, missing = filter_publications(self.profile_items, before=cutoff)
+        identifiers = {item['id'] for item in selected}
+        chosen = [str(index) for index, item in enumerate(self.profile_items) if item['id'] in identifiers]
+        self.profile_tree.selection_set(chosen)
+        self.update_profile_counts()
+        self.status.set(f'{len(chosen)} selecionados ate {cutoff:%d/%m/%Y} (inclusive, UTC). {missing} sem data excluidos da selecao.')
+
+    def load_profile_dates(self, cutoff=None):
+        if (self.worker and self.worker.is_alive()) or self.runner.running:
+            self.status.set('Aguarde a tarefa atual antes de consultar datas.')
+            return
+        items = [dict(item) for item in self.profile_items if not publication_day(item.get('date'))]
+        if not items:
+            self.status.set('Nao ha datas pendentes nesta lista.')
+            return
+        try:
+            session = self.instagram_session.load()
+            profile = normalize_profile(self.profile_url.get())
+        except (SessionError, ValueError) as exc:
+            self.status.set(str(exc))
+            return
+        def task():
+            try:
+                def on_date(identifier, value):
+                    item = next(item for item in items if item['id'] == identifier)
+                    if value:
+                        item['date'] = value
+                        self.store.save_discovery(profile, item)
+                    self.emit('profile_date', (identifier, value))
+                message = load_publication_dates(items, session, self.worker_cancel, on_date)
+                self.emit('profile_dates_done', (cutoff, message))
+            except Exception as exc:
+                SESSION_LOG.warning('stage=publication_dates error_type=%s', type(exc).__name__)
+                self.emit('profile_dates_done', (cutoff, 'Consulta de datas interrompida. Datas obtidas preservadas.'))
+        if self.work(task):
+            self.profile_stop_button.configure(state='normal')
+            self.status.set(f'Consultando datas de {len(items)} publicacoes. Use Parar consulta para interromper.')
 
     def add_profile(self):
         try:
@@ -570,7 +829,21 @@ class InstantDownloaderApp(ctk.CTk):
                 kind, payload = self.events.get_nowait()
             except queue.Empty:
                 break
-            if kind == 'analysis':
+            if kind == 'profile_date':
+                identifier, value = payload
+                for item in self.profile_items:
+                    if item['id'] == identifier and value:
+                        item['date'] = value
+                self.render_profile()
+            elif kind == 'profile_dates_done':
+                cutoff, message = payload
+                self.profile_stop_button.configure(state='disabled')
+                if cutoff is not None:
+                    self.apply_profile_cutoff(cutoff)
+                    self.status.set(message + ' ' + self.status.get())
+                else:
+                    self.status.set(message)
+            elif kind == 'analysis':
                 self.analyzed_url, self.info = payload
                 title = self.info.title or 'Video sem titulo'
                 author = self.info.uploader or 'Autor indisponivel'
@@ -600,6 +873,36 @@ class InstantDownloaderApp(ctk.CTk):
                 self.thumb.configure(image=None, text='Miniatura indisponivel')
             elif kind == 'worker_done':
                 self.analyze_button.configure(state='normal')
+                for button in self.session_buttons:
+                    button.configure(state='normal')
+                self.session_cancel_button.configure(state='disabled')
+                self.session_confirm_button.configure(state='disabled')
+                self.session_buttons[0].configure(text='Reconectar Instagram' if self.instagram_session.captured else 'Conectar Instagram')
+            elif kind == 'session_progress':
+                self.session_status.set(payload)
+            elif kind == 'session_login_ready':
+                if not self.closing and not self.worker_cancel.is_set():
+                    self.session_confirm_button.configure(state='normal')
+            elif kind == 'session_attempt_error':
+                self.last_session_error = f'{time.strftime("%H:%M:%S")}\n{payload}'
+                self.session_error_button.configure(state='normal')
+                self.session_status.set(payload)
+                self.status.set('Verificacao pendente. O navegador continua aberto; nenhuma nova tentativa sera automatica.')
+                if not self.closing and not self.worker_cancel.is_set():
+                    self.session_confirm_button.configure(state='normal')
+                    messagebox.showwarning('Verificacao pendente - navegador aberto', payload, parent=self)
+            elif kind == 'session_result':
+                self.session_status.set(payload)
+                self.status.set('Operacao de sessao encerrada. Confira o resultado nas configuracoes.')
+            elif kind == 'session_error':
+                # Keep the connection failure even if a later test only reports missing state.
+                if not self.last_session_error or not payload.startswith(('Sessao ausente', 'Cookies capturados;')):
+                    self.last_session_error = f'{time.strftime("%H:%M:%S")}\n{payload}'
+                self.session_error_button.configure(state='normal')
+                self.session_status.set(payload)
+                self.status.set('Falha na operacao do Instagram. Consulte Ver ultimo erro e os logs do terminal.')
+                if not self.closing:
+                    messagebox.showerror('Operacao do Instagram nao concluida', payload, parent=self)
             elif kind in ('queue_status', 'error'):
                 self.status.set(payload)
                 if kind == 'error':
@@ -622,13 +925,54 @@ class InstantDownloaderApp(ctk.CTk):
                 self.refresh()
                 self.show('Fila')
             elif kind == 'discovery_item':
-                if not any(i['id'] == payload['id'] for i in self.profile_items):
+                for index, item in enumerate(self.profile_items):
+                    if item['id'] == payload['id']:
+                        self.profile_items[index] = payload
+                        break
+                else:
                     self.profile_items.append(payload)
-                    self.render_profile()
+                self.render_profile()
                 self.profile_feedback.configure(text=f'{len(self.profile_items)} videos encontrados. Voce pode parar a consulta.')
             elif kind == 'discovery_done':
-                self.profile_feedback.configure(text=payload)
-                self.status.set('Consulta encerrada. Revise os resultados antes de adicionar.')
+                self.profile_result = payload
+                self.profile_stop_button.configure(state='disabled')
+                self.update_profile_counts()
+                if not payload.complete:
+                    reasons = {
+                        'session_unavailable': 'O Instagram nao disponibilizou esta consulta. Configure uma sessao autorizada e tente novamente.',
+                        'browser_session': 'Nao foi possivel usar a sessao do navegador. Entre no Instagram nesse navegador e confira o usuario nas configuracoes.',
+                        'rate_limited': 'O Instagram limitou as consultas. Aguarde antes de tentar novamente.',
+                        'local_throttle': 'A biblioteca interrompeu a consulta por uma pausa preventiva local. Isso nao confirma um bloqueio HTTP 429 do Instagram.',
+                        'cancelled': 'Consulta interrompida. A lista contem apenas os videos encontrados ate agora.',
+                        'invalid_input': 'Confira o perfil e as configuracoes de sessao.',
+                        'dependency_missing': 'Instale as dependencias de descoberta de perfis.',
+                    }
+                    message = reasons.get(payload.error_code, 'Nao foi possivel concluir a consulta. Veja os detalhes do erro.')
+                    if payload.failed_source in ('posts', 'reels'):
+                        origin = 'Feed' if payload.failed_source == 'posts' else 'Reels'
+                        message = f'Falha na origem {origin}. {message}'
+                        if self.profile_scopes == ('posts', 'reels') and payload.failed_source == 'posts':
+                            message += ' Reels nao foi consultado porque a busca parou no Feed.'
+                    if payload.items:
+                        message += ' Resultados parciais preservados.'
+                    if payload.error_code in ('session_unavailable', 'browser_session', 'invalid_input'):
+                        self.profile_session_button.pack(side='left')
+                    else:
+                        self.profile_session_button.pack_forget()
+                    self.profile_actions.grid()
+                    self.status.set('Consulta incompleta. A contagem total nao foi confirmada.')
+                elif not payload.items:
+                    message = ('Nenhum video encontrado nas origens consultadas.' if payload.all_collected else
+                               'Nenhum video encontrado no limite consultado. Podem existir mais publicacoes.')
+                elif payload.all_collected:
+                    message = 'Fim das origens consultadas. Revise os videos e adicione os selecionados a fila.'
+                else:
+                    message = 'Limite atingido. Contagens parciais; podem existir mais videos. Aumente o limite para consultar novamente.'
+                self.profile_feedback.configure(text=message)
+                if payload.complete:
+                    self.status.set('Consulta encerrada. Adicione os selecionados e use Iniciar na Fila.' if payload.items else 'Consulta encerrada sem videos encontrados.')
+                if not self.profile_items:
+                    self.profile_tree.empty_label.configure(text='Consulta indisponivel' if not payload.complete else 'Nenhum video encontrado nesta consulta.')
         if self.closing and not self.runner.running and not (self.worker and self.worker.is_alive()):
             self.app_lock.close()
             self.destroy()
@@ -646,6 +990,8 @@ class InstantDownloaderApp(ctk.CTk):
 
 
 def main():
+    configure_session_logging()
+    SESSION_LOG.info('app_started diagnostics=enabled credentials_logging=disabled')
     try:
         app = InstantDownloaderApp()
         app.mainloop()

@@ -42,6 +42,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, default=Path('portfolio_assets/audit'))
     parser.add_argument('--live-url')
+    parser.add_argument('--sample-profile', action='store_true', help='Show isolated fixture rows in profile captures.')
+    parser.add_argument('--profile-error', action='store_true', help='Show a simulated unavailable Reels query.')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
@@ -54,6 +56,25 @@ def main():
         app = InstantDownloaderApp(Path(home))
         try:
             app.update()
+            if args.sample_profile:
+                app.profile_url.set('@perfil_de_teste')
+                app.profile_items = [
+                    {'id': 'shared', 'title': 'Video presente no Feed e nos Reels', 'date': '2026-11-03', 'sources': ['posts', 'reels']},
+                    {'id': 'reel', 'title': 'Reel encontrado na consulta', 'date': '2026-11-02', 'sources': ['reels']},
+                    {'id': 'feed', 'title': 'Video do Feed', 'date': '2026-11-01', 'sources': ['posts']},
+                ]
+                app.render_profile()
+                app.profile_tree.selection_set(app.profile_tree.get_children())
+                app.profile_feedback.configure(text='Limite atingido. Contagens parciais; podem existir mais videos.')
+            if args.profile_error:
+                from instantdownloader.core.profiles import DiscoveryResult
+                app.profile_url.set('@perfil_de_teste')
+                app.scope.set('Reels')
+                app.profile_scopes = ('reels',)
+                app.profile_items = []
+                app.render_profile()
+                app.emit('discovery_done', DiscoveryResult([], False, 'Simulated unavailable Reels response.',
+                    {'reels': 0}, {'reels': False}, 'session_unavailable', 'reels'))
             if args.live_url:
                 info = analyze_url(args.live_url, app.config())
                 app.emit('analysis', (args.live_url, info))
